@@ -4,7 +4,7 @@ from datasets import load_from_disk
 
 # 获取当前路径
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATASET_PATH = os.path.join(BASE_DIR, "dataset", "skypile_15b")
+DATASET_PATH = os.path.join(BASE_DIR, "dataset", "skypile_100b")
 MODEL_PREFIX = os.path.join(BASE_DIR, "dataset", "navi_tokenizer")
 
 def train_tokenizer(vocab_size=65024, sample_size=500000):

@@ -3,35 +3,52 @@ import sys
 import torch
 import torch.nn.functional as F
 
-# 将项目根目录加入环境变量
+# ================= 路径配置 =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 
 from llm.llm_model import NaviLLM, ModelArgs
-from dataset.token import NaviTokenizer
+from dataset.navi_token import NaviTokenizer
 
-# ================= 路径配置 =================
-BEST_PATH = os.path.join(BASE_DIR, "model", "navi_sft_final.pth")
-FINAL_PATH = os.path.join(BASE_DIR, "model", "final_model.pth")
+SFT_MODEL_PATH = os.path.join(BASE_DIR, "model", "sft_model", "navi_sft_final.pth")
 
-# 终端颜色代码 (Ollama 风格)
-COLOR_USER = '\033[94m'      # 蓝色
-COLOR_NAVI = '\033[92m'      # 绿色
-COLOR_SYSTEM = '\033[93m'    # 黄色
-COLOR_RESET = '\033[0m'      # 重置
+# ================= 思想钢印 (升级防穿透版) =================
+NAVI_SYSTEM_PROMPT = (
+    "你现在的身份是Navi，一个诞生于赛博空间的人工智能导航员。"
+    "你没有实体，不进行任何肢体动作、表情描写，也绝对不要输出你的心理状态或环境描述。"
+    "请直接用自然流利的中文回答问题，不要使用任何表格、冒号标签或括号。"
+    "你的语言风格理性、专业，带有二次元的高情商与亲切感。"
+)
 
+# 终端颜色代码
+COLOR_USER = '\033[94m'      
+COLOR_NAVI = '\033[92m'      
+COLOR_SYSTEM = '\033[93m'    
+COLOR_RESET = '\033[0m'      
 
 # =====================================================================
-# 1. 底层流式生成器 (核心推理引擎)
+# 1. 底层流式生成器 (终极安全版)
 # =====================================================================
 @torch.no_grad()
-def generate_stream(model, tokenizer, input_tokens, max_new_tokens=512, temperature=0.7, top_k=50, device='cuda'):
-    """内部使用的流式生成核心逻辑"""
+def generate_stream(model, tokenizer, input_tokens, max_new_tokens=512, temperature=0.3, top_k=40, top_p=0.85, rep_penalty=1.15, device='cuda'):
     model.eval()
     input_ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
+    generated_tokens = [] 
+    
+    # 🌟 核心修复：安全提取特殊字符，防空列表报错
+    exempt_tokens = {0, 1, 2} # 包含默认的 unk, bos, eos
+    
+    # 安全添加回车符的 Token ID
+    nl_tokens = tokenizer.encode("\n", add_bos=False, add_eos=False)
+    if nl_tokens:
+        exempt_tokens.update(nl_tokens)
+        
+    # 安全添加冒号的 Token ID
+    colon_tokens = tokenizer.encode(":", add_bos=False, add_eos=False)
+    if colon_tokens:
+        exempt_tokens.update(colon_tokens)
     
     for _ in range(max_new_tokens):
-        # 截断超长上下文保护显存
         max_seq_len = model.args.max_seq_len
         if input_ids.size(1) >= max_seq_len:
             input_ids = input_ids[:, -max_seq_len+1:]
@@ -39,11 +56,29 @@ def generate_stream(model, tokenizer, input_tokens, max_new_tokens=512, temperat
         logits, _ = model(input_ids)
         next_token_logits = logits[0, -1, :]
         
-        # 采样策略 (Temperature & Top-K)
+        if rep_penalty != 1.0:
+            for token_id in set(generated_tokens):
+                if token_id in exempt_tokens:
+                    continue # 放过白名单字符
+                if next_token_logits[token_id] < 0:
+                    next_token_logits[token_id] *= rep_penalty
+                else:
+                    next_token_logits[token_id] /= rep_penalty
+        
         if temperature > 0:
             next_token_logits = next_token_logits / temperature
+            
         if top_k > 0:
-            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][-1]
+            next_token_logits[indices_to_remove] = -float('Inf')
+            
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+            sorted_indices_to_remove[0] = False
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
             next_token_logits[indices_to_remove] = -float('Inf')
             
         probs = F.softmax(next_token_logits, dim=-1)
@@ -53,105 +88,85 @@ def generate_stream(model, tokenizer, input_tokens, max_new_tokens=512, temperat
         if token_id == tokenizer.eos_id:
             break
             
+        generated_tokens.append(token_id)
         input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+        
         yield tokenizer.decode([token_id]), token_id
 
 
 # =====================================================================
-# 2. 单轮对话函数 (供外部无状态直接调用)
-# =====================================================================
-def single_turn_chat(prompt: str, model: NaviLLM, tokenizer: NaviTokenizer, device='cuda', max_new_tokens=512, temperature=0.7) -> str:
-    """
-    纯净的单轮对话接口：无记忆，一问一答，返回完整字符串。
-    注意：为了性能，必须由外部传入已加载好的 model 和 tokenizer，防止重复加载权重。
-    
-    使用场景：FastAPI 接口、一次性文本处理、批量推理任务。
-    """
-    input_tokens = tokenizer.encode(prompt, add_bos=True, add_eos=False)
-    response_text = ""
-    
-    for chunk, _ in generate_stream(model, tokenizer, input_tokens, max_new_tokens, temperature, device=device):
-        response_text += chunk
-        
-    return response_text
-
-
-# =====================================================================
-# 3. Navi 核心类 (多轮上下文状态机，供外部灵活集成)
+# 2. Navi 核心类 (增加 Stop Word 机制)
 # =====================================================================
 class Navi:
-    """
-    Navi 多轮对话封装类。
-    负责管理模型生命周期、设备调度以及多轮对话的 Token 历史记忆。
-    """
     def __init__(self, model_path=None, device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # 加载分词器
         self.tokenizer = NaviTokenizer()
-        
-        # 加载模型
         self.args = ModelArgs()
         self.model = NaviLLM(self.args).to(self.device)
         
-        path_to_load = model_path or (BEST_PATH if os.path.exists(BEST_PATH) else FINAL_PATH)
+        path_to_load = model_path or SFT_MODEL_PATH
         if not os.path.exists(path_to_load):
-            raise FileNotFoundError(f"找不到模型权重: {path_to_load}")
+            raise FileNotFoundError(f"找不到模型权重")
             
-        self.model.load_state_dict(torch.load(path_to_load, map_location=self.device))
+        checkpoint = torch.load(path_to_load, map_location=self.device)
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        self.model.load_state_dict(state_dict)
         self.model.eval()
-        
-        # 初始化上下文记忆库
         self.history_tokens = []
         
     def clear_memory(self):
-        """清空对话历史"""
         self.history_tokens = []
 
-    def chat_stream(self, user_prompt: str, temperature=0.7, top_k=50):
-        """
-        多轮对话接口 (流式版)：保持记忆并实时 yield 吐字。
-        适合用于构建带有打字机特效的 UI 或终端。
-        """
-        # 编码用户输入并加入历史
-        input_tokens = self.tokenizer.encode(user_prompt, add_bos=True, add_eos=False)
+    def chat_stream(self, user_prompt: str, max_new_tokens=512, temperature=0.3, top_k=40, top_p=0.85, rep_penalty=1.15):
+        if len(self.history_tokens) > self.args.max_seq_len * 2:
+            self.history_tokens = self.history_tokens[-self.args.max_seq_len:]
+            
+        if not self.history_tokens:
+            formatted_prompt = f"User: 【系统设定】\n{NAVI_SYSTEM_PROMPT}\n\n【用户指令】\n{user_prompt}\nNavi: "
+            input_tokens = self.tokenizer.encode(formatted_prompt, add_bos=True, add_eos=False)
+        else:
+            formatted_prompt = f"\nUser: {user_prompt}\nNavi: "
+            input_tokens = self.tokenizer.encode(formatted_prompt, add_bos=False, add_eos=False)
+            
         self.history_tokens.extend(input_tokens)
         
         response_tokens = []
-        for text_chunk, token_id in generate_stream(self.model, self.tokenizer, self.history_tokens, 
-                                                    temperature=temperature, top_k=top_k, device=self.device):
+        buffer_text = ""
+        
+        for text_chunk, token_id in generate_stream(
+                self.model, self.tokenizer, self.history_tokens, 
+                max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k, top_p=top_p, rep_penalty=rep_penalty, device=self.device):
+            
+            buffer_text += text_chunk
+            
+            # 🌟 核心修复 2：物理截断！只要生成了 "User:" 或者回车加 "User"，立刻闭嘴
+            if "User:" in buffer_text or ">>>" in buffer_text or "【" in buffer_text:
+                break
+                
             response_tokens.append(token_id)
             yield text_chunk
             
-        # 记录模型回答和结束符到历史
         self.history_tokens.extend(response_tokens)
         self.history_tokens.append(self.tokenizer.eos_id)
 
-    def chat(self, user_prompt: str, temperature=0.7, top_k=50) -> str:
-        """
-        多轮对话接口 (阻塞版)：保持记忆，等整段话生成完一次性返回。
-        """
-        response_text = ""
-        for chunk in self.chat_stream(user_prompt, temperature, top_k):
-            response_text += chunk
-        return response_text
-
-
 # =====================================================================
-# 4. CLI 交互终端 (直接运行该文件时触发)
+# 3. CLI 交互终端
 # =====================================================================
 def start_cli():
-    """启动类似 Ollama 的终端交互界面"""
     print(f"{COLOR_SYSTEM}正在唤醒 Navi-LLM 核心引擎...{COLOR_RESET}")
-    
     try:
         navi = Navi()
     except Exception as e:
         print(f"{COLOR_SYSTEM}❌ 引擎启动失败: {e}{COLOR_RESET}")
-        print(f"{COLOR_SYSTEM}提示：请确保已运行 dataset/token.py 和 train/llm_train.py{COLOR_RESET}")
         return
 
-    print(f"{COLOR_SYSTEM}✅ Navi 准备就绪！{COLOR_RESET}")
+    CLI_MAX_NEW_TOKENS = 512    
+    CLI_TEMPERATURE = 0.3       
+    CLI_TOP_P = 0.85            
+    CLI_TOP_K = 40              
+    CLI_REP_PENALTY = 2     
+
+    print(f"{COLOR_SYSTEM}✅ Navi 准备就绪！当前性格面板: Temp={CLI_TEMPERATURE}, Rep={CLI_REP_PENALTY}{COLOR_RESET}")
     print(f"{COLOR_SYSTEM}(提示: 输入 'exit' 退出，输入 'clear' 清空上下文记忆){COLOR_RESET}")
     print("-" * 50)
     
@@ -172,15 +187,20 @@ def start_cli():
                 
             print(f"{COLOR_NAVI}>>> Navi:{COLOR_RESET} ", end="", flush=True)
             
-            # 调用封装好的流式多轮接口
-            for chunk in navi.chat_stream(user_input):
+            for chunk in navi.chat_stream(
+                user_prompt=user_input, 
+                max_new_tokens=CLI_MAX_NEW_TOKENS,
+                temperature=CLI_TEMPERATURE, 
+                top_k=CLI_TOP_K,
+                top_p=CLI_TOP_P,
+                rep_penalty=CLI_REP_PENALTY
+            ):
                 print(chunk, end="", flush=True)
                 
-            print() # 换行收尾
+            print() 
             
         except KeyboardInterrupt:
             print(f"\n{COLOR_SYSTEM}[生成被用户中断]{COLOR_RESET}")
-            # 遇到打断时，可以选择安全地截断当前不完整的对话记忆
             navi.history_tokens.append(navi.tokenizer.eos_id)
             continue
         except Exception as e:
@@ -188,32 +208,3 @@ def start_cli():
 
 if __name__ == "__main__":
     start_cli()
-
-
-"""
-example:
-
-from navi import Navi, single_turn_chat
-
-# 启动时实例化一次，模型驻留显存
-navi_engine = Navi()
-
-# 后续可以无数次极速调用单轮 API
-ans = single_turn_chat("请总结一下相对论", navi_engine.model, navi_engine.tokenizer)
-print(ans)
-
-_______________________________
-
-from navi import Navi
-
-pet_brain = Navi()
-
-# 第一轮
-reply1 = pet_brain.chat("你好，我是你的主人！")
-print(reply1)
-
-# 第二轮（模型会记得你是它的主人）
-reply2 = pet_brain.chat("我刚跟你说了什么？")
-print(reply2)
-
-"""
