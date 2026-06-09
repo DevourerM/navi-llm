@@ -4,30 +4,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-# ==========================================
-# 1. 超参数配置类
-# ==========================================
 @dataclass
 class ModelArgs:
-    # 基础参数
-    vocab_size: int = 65024     
-    max_seq_len: int = 2048     
-    dim: int = 2048             
-    n_layers: int = 24         
-    n_heads: int = 16           
-    
-    # 加深变窄 FFN
-    ffn_hidden_dim: int = 2560  
-    
-    # 其他参数
-    norm_eps: float = 1e-6      
-    dropout: float = 0.1
+    """NaviLLM 模型核心超参数配置类"""
+    vocab_size: int = 65024       # 词表大小
+    max_seq_len: int = 2048       # 最大序列长度 (Context Window)
+    dim: int = 1792               # 隐藏层维度 (Hidden Size) — 2048→1792, 降 15% 参数
+    n_layers: int = 22            # Transformer 总层数 — 24→22
+    n_heads: int = 14             # 注意力头数 — 16→14 (head_dim=128 不变)
+    ffn_hidden_dim: int = 2304    # 加深变窄型 FFN 的内部隐藏层维度 — 2560→2304
+    norm_eps: float = 1e-6        # RMSNorm 的稳定项 Epsilon
+    dropout: float = 0.1          # Dropout 概率
 
-# ==========================================
-# 2. 核心基础组件
-# ==========================================
 class RMSNorm(nn.Module):
-    """均方根归一化"""
+    """均方根归一化 (Root Mean Square Layer Normalization)"""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -40,14 +30,14 @@ class RMSNorm(nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 def precompute_rope_freqs(dim: int, seq_len: int, theta: float = 10000.0):
-    """预计算 RoPE 旋转频率矩阵"""
+    """预计算旋转位置编码 (RoPE) 的复数频率矩阵"""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     return torch.polar(torch.ones_like(freqs), freqs)
 
 def apply_rope(xq, xk, freqs_cis):
-    """应用旋转位置编码"""
+    """将预计算的旋转位置编码应用到 Query 和 Key 张量上"""
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2) 
@@ -55,11 +45,8 @@ def apply_rope(xq, xk, freqs_cis):
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-# ==========================================
-# 3. 加深变窄 FFN + SwiGLU
-# ==========================================
 class SwiGLU(nn.Module):
-    """单层 SwiGLU 门控激活"""
+    """经典门控线性单元激活层 (Swish-Gated Linear Unit)"""
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
@@ -70,12 +57,7 @@ class SwiGLU(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class DeepResidualFFN(nn.Module):
-    """加深变窄 FFN: 两层 SwiGLU + 残差直连
-    
-       x → SwiGLU₁ → +x (残差) → Norm → SwiGLU₂ → 输出
-       
-    参数量: 2 × 3 × dim × hidden_dim ≈ 2 × 3 × 2048 × 4096 ≈ 50M/层
-    """
+    """加深变窄型前馈网络 (包含双层 SwiGLU 与内部残差直连)"""
     def __init__(self, dim: int, hidden_dim: int, eps: float = 1e-6):
         super().__init__()
         self.swiglu1 = SwiGLU(dim, hidden_dim)
@@ -84,15 +66,13 @@ class DeepResidualFFN(nn.Module):
 
     def forward(self, x):
         h = self.swiglu1(x)
-        h = x + h                    # 🌟 残差直连
+        h = x + h                    # 内部第一层残差直连
         h = self.inner_norm(h)
         h = self.swiglu2(h)
         return h
 
-# ==========================================
-# 4. 上下文压缩器 + 注意力机制
-# ==========================================
 class CausalSelfAttention(nn.Module):
+    """因果自注意力机制模块 (包含 QK-Norm 增强数值稳定性)"""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
@@ -103,7 +83,7 @@ class CausalSelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, args.dim, bias=False)
         self.wo = nn.Linear(args.dim, args.dim, bias=False)
         
-        # QK-Norm
+        # QK-Norm: 稳定深层注意力机制的超大点积方差
         self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
         
@@ -131,10 +111,8 @@ class CausalSelfAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(output)
 
-# ==========================================
-# 5. Transformer 块
-# ==========================================
 class TransformerBlock(nn.Module):
+    """标准 Transformer 解码器块"""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.attention = CausalSelfAttention(args)
@@ -147,10 +125,8 @@ class TransformerBlock(nn.Module):
         out = h + self.ffn(self.ffn_norm(h))
         return out
 
-# ==========================================
-# 6. 顶层模型：NaviLLM
-# ==========================================
 class NaviLLM(nn.Module):
+    """顶层根模型主体"""
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -161,19 +137,30 @@ class NaviLLM(nn.Module):
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         
-        # 权重绑定
+        # 权重绑定 (Weight Tying)
         self.output.weight = self.tok_embeddings.weight
         self.freqs_cis = precompute_rope_freqs(args.dim // args.n_heads, args.max_seq_len)
+        
+        # 执行工业标准权值初始化
         self.apply(self._init_weights)
+        self._init_residual_weights()
 
     def _init_weights(self, module):
-        """标准正态分布初始化"""
+        """基础权重分布初始化"""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _init_residual_weights(self):
+        """🌟 核心修复：对所有残差输出层的投影矩阵应用深度缩放，锁死方差爆炸"""
+        # 每个 Block 包含 3 个残差引入点 (Attention, SwiGLU1, SwiGLU2)
+        scale_factor = 0.02 / math.sqrt(3 * self.args.n_layers)
+        for name, param in self.named_parameters():
+            if name.endswith('attention.wo.weight') or name.endswith('ffn.swiglu1.w2.weight') or name.endswith('ffn.swiglu2.w2.weight'):
+                torch.nn.init.normal_(param, mean=0.0, std=scale_factor)
 
     def forward(self, tokens, targets=None):
         B, T = tokens.shape
