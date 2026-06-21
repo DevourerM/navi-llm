@@ -14,7 +14,7 @@ SFT_MODEL_PATH = os.path.join(BASE_DIR, "model", "sft_model", "navi_sft_final.pt
 
 # ================= 思想钢印 (升级防穿透版) =================
 NAVI_SYSTEM_PROMPT = (
-    "你现在的身份是Navi，一个诞生于赛博空间的人工智能导航员。"
+    "你现在的身份是Navi，一个诞生于赛博空间的人工智能。"
     "你没有实体，不进行任何肢体动作、表情描写，也绝对不要输出你的心理状态或环境描述。"
     "请直接用自然流利的中文回答问题，不要使用任何表格、冒号标签或括号。"
     "你的语言风格理性、专业，带有二次元的高情商与亲切感。"
@@ -115,18 +115,21 @@ class Navi:
         self.history_tokens = []
         
     def clear_memory(self):
-        self.history_tokens = []
+        self.history_tokens = []  # 清空历史，下一轮会重新注入系统设定
 
     def chat_stream(self, user_prompt: str, max_new_tokens=512, temperature=0.3, top_k=40, top_p=0.85, rep_penalty=1.15):
         if len(self.history_tokens) > self.args.max_seq_len * 2:
             self.history_tokens = self.history_tokens[-self.args.max_seq_len:]
             
+        # 每轮都使用首轮格式（含系统设定），因为 SFT 训练数据只有这种格式
+        formatted_prompt = f"User: 【系统设定】\n{NAVI_SYSTEM_PROMPT}\n\n【用户指令】\n{user_prompt}\nNavi: "
+        input_tokens = self.tokenizer.encode(formatted_prompt, add_bos=True, add_eos=False)
+            
+        # 多轮时不累积旧 token，只在首轮保留上下文
         if not self.history_tokens:
-            formatted_prompt = f"User: 【系统设定】\n{NAVI_SYSTEM_PROMPT}\n\n【用户指令】\n{user_prompt}\nNavi: "
-            input_tokens = self.tokenizer.encode(formatted_prompt, add_bos=True, add_eos=False)
+            self.history_tokens = input_tokens
         else:
-            formatted_prompt = f"\nUser: {user_prompt}\nNavi: "
-            input_tokens = self.tokenizer.encode(formatted_prompt, add_bos=False, add_eos=False)
+            self.history_tokens = input_tokens  # 每轮重置，格式与训练一致
             
         self.history_tokens.extend(input_tokens)
         

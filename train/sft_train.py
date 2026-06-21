@@ -9,6 +9,9 @@ import time
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
+# 限制显存占用
+torch.cuda.set_per_process_memory_fraction(0.80)
+
 # 🌟 [极速优化 1]：开启 TF32，彻底释放 5090 的 Tensor Core 矩阵算力
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -36,12 +39,12 @@ SFT_FINAL_PATH = os.path.join(SFT_MODEL_DIR, "navi_sft_final.pth")
 class SFTArgs:
     micro_batch_size: int = 4
     gradient_accumulation_steps: int = 4     
-    epochs: int = 3                          
+    epochs: int = 1                          # 3→1, 基座弱避免灾难性遗忘
     max_seq_len: int = 1024                  
 
-    learning_rate: float = 1e-5              
-    min_lr: float = 1e-6
-    warmup_steps: int = 150                  
+    learning_rate: float = 3e-6              # 1e-5→3e-6, 极低 lr 保护预训练知识
+    min_lr: float = 3e-7                     # 1e-6→3e-7
+    warmup_steps: int = 200                  # 150→200, warmup 占比提高
 
     weight_decay: float = 0.1
     grad_clip: float = 1.0
@@ -130,48 +133,48 @@ def log_detailed_metrics(writer, model, tokenizer, step):
             writer.add_histogram(f"SFT_Weights/{name}", param.detach().cpu(), step)
             if param.grad is not None:
                 writer.add_histogram(f"SFT_Gradients/{name}", param.grad.detach().cpu(), step)
-                
-    proj_size = 2000 
-    try:
-        embeddings = raw_model.tok_embeddings.weight[:proj_size].detach().cpu()
-        metadata = []
-        for i in range(proj_size):
-            try:
-                token_str = tokenizer.decode([i]).replace('\n', '\\n').replace('\r', '')
-                metadata.append(token_str if token_str else f"<TOKEN_{i}>")
-            except:
-                metadata.append(f"<UNK_{i}>")
-        writer.add_embedding(embeddings, metadata=metadata, global_step=step, tag="TokenEmbeddings_Top2K")
-    except Exception:
-        pass
 
 @torch.no_grad()
-def log_text_generation(writer, model, tokenizer, device, step, prompt="你是谁？", max_new_tokens=60):
-    # 🌟 [极速优化 避坑]：生成任务绝对不能用 compile 后的模型，否则每次循环都会触发重编译！
+def log_text_generation(writer, model, tokenizer, device, step):
+    """
+    生成文本样本 — 用多个温度和关键问题展示 SFT 效果
+    生成任务不能使用 compile 后的模型，需要提取原始模型
+    """
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     raw_model.eval()
-    try:
-        formatted_prompt = f"User: {prompt}\nNavi: "
-        input_ids = tokenizer.encode(formatted_prompt, add_bos=True, add_eos=False)
-        x = torch.tensor([input_ids], dtype=torch.long, device=device)
-        generated = []
-        
-        for _ in range(max_new_tokens):
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16): # 保持 BF16
-                logits, _ = raw_model(x)
-            next_token = torch.argmax(logits[0, -1, :]).item()
-            if next_token == tokenizer.eos_id:
-                break
-            generated.append(next_token)
-            x = torch.cat([x, torch.tensor([[next_token]], device=device)], dim=1)
-            
-        result_text = tokenizer.decode(generated)
-        writer.add_text("SFT_Generation", f"**Q:** {prompt}\n\n**Navi:** {result_text}", step)
-        print(f"\n[SFT Chat Sample] 🧠 \nUser: {prompt}\nNavi: {result_text}\n")
-    except Exception:
-        pass
-    finally:
-        raw_model.train()
+    
+    # 身份相关 prompt 能直接看出 SFT 是否成功
+    prompts = ["你是谁？", "你的身份是什么", "今天天气如何"]
+    temps = [0.1, 0.5, 0.8]
+    
+    for prompt in prompts[:2]:  # 前两个测试不同温度
+        for temp in temps:
+            try:
+                formatted_prompt = f"User: {prompt}\nNavi: "
+                input_ids = tokenizer.encode(formatted_prompt, add_bos=True, add_eos=False)
+                x = torch.tensor([input_ids], dtype=torch.long, device=device)
+                generated = []
+                for _ in range(60):
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        logits, _ = raw_model(x)
+                    logits = logits[0, -1, :] / temp
+                    top_k = 40
+                    thresh = torch.topk(logits, top_k)[0][-1]
+                    logits[logits < thresh] = -float('Inf')
+                    probs = torch.nn.functional.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, 1).item()
+                    if next_token == tokenizer.eos_id:
+                        break
+                    generated.append(next_token)
+                    x = torch.cat([x, torch.tensor([[next_token]], device=device)], dim=1)
+                result_text = tokenizer.decode(generated)
+                tag = f"SFT_Gen/T{temp}_{prompt[:10]}"
+                writer.add_text(tag, f"**Q:** {prompt}\n\n**A:** {result_text}", step)
+                if temp == 0.5:
+                    print(f"[SFT Sample T=0.5] Q: {prompt}\nA: {result_text[:120]}")
+            except Exception:
+                pass
+    raw_model.train()
 
 # ================= 主训练循环 =================
 def train():
@@ -287,7 +290,7 @@ def train():
                 
                 if global_step % 400 == 0:
                     log_detailed_metrics(writer, model, tokenizer, global_step)
-                    log_text_generation(writer, model, tokenizer, device, global_step, prompt="你是谁？")
+                    log_text_generation(writer, model, tokenizer, device, global_step)
                     
                     torch.save({
                         'epoch': epoch,

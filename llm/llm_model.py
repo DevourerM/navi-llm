@@ -9,10 +9,10 @@ class ModelArgs:
     """NaviLLM 模型核心超参数配置类"""
     vocab_size: int = 65024       # 词表大小
     max_seq_len: int = 2048       # 最大序列长度 (Context Window)
-    dim: int = 1792               # 隐藏层维度 (Hidden Size) — 2048→1792, 降 15% 参数
-    n_layers: int = 22            # Transformer 总层数 — 24→22
-    n_heads: int = 14             # 注意力头数 — 16→14 (head_dim=128 不变)
-    ffn_hidden_dim: int = 2304    # 加深变窄型 FFN 的内部隐藏层维度 — 2560→2304
+    dim: int = 2048               # 隐藏层维度 (Hidden Size)
+    n_layers: int = 26            # Transformer 总层数
+    n_heads: int = 16             # 注意力头数 (head_dim=128)
+    ffn_hidden_dim: int = 3072    # 加深变窄型 FFN 的内部隐藏层维度
     norm_eps: float = 1e-6        # RMSNorm 的稳定项 Epsilon
     dropout: float = 0.1          # Dropout 概率
 
@@ -155,7 +155,7 @@ class NaviLLM(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _init_residual_weights(self):
-        """🌟 核心修复：对所有残差输出层的投影矩阵应用深度缩放，锁死方差爆炸"""
+        """核心修复：对所有残差输出层的投影矩阵应用深度缩放，锁死方差爆炸"""
         # 每个 Block 包含 3 个残差引入点 (Attention, SwiGLU1, SwiGLU2)
         scale_factor = 0.02 / math.sqrt(3 * self.args.n_layers)
         for name, param in self.named_parameters():

@@ -7,9 +7,10 @@ import time
 # 优化 CUDA 显存管理器，消除碎片化 OOM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import torch.nn.functional as F
 
 # 限制显存占用上限，防止占满整卡
-torch.cuda.set_per_process_memory_fraction(0.65)
+torch.cuda.set_per_process_memory_fraction(0.80)
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -38,11 +39,11 @@ FINAL_PATH = os.path.join(MODEL_DIR, "final_model.pth")
 # ================= 训练超参数 =================
 @dataclass
 class TrainArgs:
-    micro_batch_size: int = 2            # 2， 减少 kernel launch 频率
-    gradient_accumulation_steps: int = 16 # 16, 等效 batch 保持 32
-    total_steps: int = 300000                # ~18B tokens (19 tokens/param, Chinchilla)
-    cosine_steps: int = 200000               # 余弦退火终点 (71% total)
-    warmup_steps: int = 4000                 # warmup 占 cosine 的 2%
+    micro_batch_size: int = 1            # 降到 1 避免 OOM, 1.55B 模型显存需求大
+    gradient_accumulation_steps: int = 32 # 等效 batch 保持 32
+    total_steps: int = 500000                # ~33B tokens (21 tokens/param, Chinchilla)
+    cosine_steps: int = 350000               # 余弦退火终点 (70% total)
+    warmup_steps: int = 7000                 # warmup 占 cosine 的 2%
 
     learning_rate: float = 3e-4              
     min_lr: float = 3e-6                     
@@ -124,44 +125,44 @@ def log_detailed_metrics(writer, model, tokenizer, step, train_args):
     total_norm = sum(p.norm(2).item() ** 2 for p in raw_model.parameters() if p is not None)
     writer.add_scalar("Debug/ParamNorm", total_norm ** 0.5, step)
 
-    proj_size = 2000 
-    if step % (train_args.save_interval * 2) == 0:
-        try:
-            embeddings = raw_model.tok_embeddings.weight[:proj_size].detach().cpu()
-            metadata = []
-            for i in range(proj_size):
-                try:
-                    token_str = tokenizer.decode([i]).replace('\n', '\\n').replace('\r', '')
-                    metadata.append(token_str if token_str else f"<TOKEN_{i}>")
-                except:
-                    metadata.append(f"<UNK_{i}>")
-            writer.add_embedding(embeddings, metadata=metadata, global_step=step, tag="TokenEmbeddings_Top2K")
-        except Exception:
-            pass
+    # Embedding 投影已禁用 (避免 projector_config.pbtxt 堆积)
 
 @torch.no_grad()
-def log_text_generation(writer, model, tokenizer, device, step, prompt="人工智能", max_new_tokens=40):
+def log_text_generation(writer, model, tokenizer, device, step, train_args):
+    """生成文本样本 — 用多个温度展示模型不同程度的表现"""
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     raw_model.eval()
-    try:
-        input_ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
-        x = torch.tensor([input_ids], dtype=torch.long, device=device)
-        generated = []
-        for _ in range(max_new_tokens):
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16): # 保持 BF16 一致性
-                logits, _ = raw_model(x)
-            next_token = torch.argmax(logits[0, -1, :]).item()
-            if next_token == tokenizer.eos_id:
-                break
-            generated.append(next_token)
-            x = torch.cat([x, torch.tensor([[next_token]], device=device)], dim=1)
-        result_text = prompt + tokenizer.decode(generated)
-        writer.add_text("Generation_Sample", result_text, step)
-        print(f"\n[Sample] 🧠 生成测试: {result_text}\n")
-    except Exception:
-        pass
-    finally:
-        raw_model.train()
+    
+    prompts = ["在这片浩瀚的星空中，", "人工智能的发展", "中国的首都是"]
+    temps = [0.1, 0.5, 0.8]
+    
+    for prompt in prompts[:2]:  # 两个 prompt 各测试不同温度
+        for temp in temps:
+            try:
+                input_ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+                x = torch.tensor([input_ids], dtype=torch.long, device=device)
+                generated = []
+                for _ in range(40):
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        logits, _ = raw_model(x)
+                    logits = logits[0, -1, :] / temp
+                    top_k = 40
+                    thresh = torch.topk(logits, top_k)[0][-1]
+                    logits[logits < thresh] = -float('Inf')
+                    probs = F.softmax(logits, dim=-1)  # noqa
+                    next_token = torch.multinomial(probs, 1).item()
+                    if next_token == tokenizer.eos_id:
+                        break
+                    generated.append(next_token)
+                    x = torch.cat([x, torch.tensor([[next_token]], device=device)], dim=1)
+                result = prompt + tokenizer.decode(generated)
+                tag = f"Gen/T{temp}_{prompt[:10]}"
+                writer.add_text(tag, result, step)
+                if temp == 0.5:
+                    print(f"\n[Sample T=0.5] {result[:120]}")
+            except Exception:
+                pass
+    raw_model.train()
 
 @torch.no_grad()
 def evaluate(model, val_loader, device, eval_iters):
@@ -292,7 +293,7 @@ def train():
         # 周期性全面体检
         if global_step > start_step and global_step % train_args.save_interval == 0:
             log_detailed_metrics(writer, model, tokenizer, global_step, train_args)
-            log_text_generation(writer, model, tokenizer, device, global_step, prompt="在这片浩瀚的星空中，", max_new_tokens=40)
+            log_text_generation(writer, model, tokenizer, device, global_step, train_args)
             
             torch.save({
                 'step': global_step,
